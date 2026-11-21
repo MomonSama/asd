@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      osu_tag:
+        description: "Optional ppy/osu release tag (e.g. 2026.804.2-lazer)"
+        required: false
+      build_expiry:
+        description: "Optional demo build expiry, UTC ISO-8601 (e.g. 2026-10-15 or 2026-10-15T00:00:00Z). Empty = no expiry."
+        required: false
+
+jobs:
+  test-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+      - name: Test Core
+        run: dotnet test tests/Maniac.Core.Tests/Maniac.Core.Tests.csproj -c Release --nologo
+
+  build-lazer:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            nupkg_rid: win-x64
+            pack_rids: win-x64
+          - os: ubuntu-latest
+            nupkg_rid: linux-x64
+            pack_rids: linux-x64
+          - os: macos-latest
+            nupkg_rid: osx-arm64
+            pack_rids: osx-arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MANIAC_BUILD_EXPIRY: ${{ github.event.inputs.build_expiry }}
+      RID: ${{ matrix.nupkg_rid }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Resolve osu!lazer release
+        id: osu
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OSU_TAG: ${{ github.event.inputs.osu_tag }}
+        run: ./.github/scripts/resolve-osu-release.ps1 -RuntimeIdentifier ${{ matrix.nupkg_rid }}
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/osu-cache
+          key: osulazer-nupkg-${{ matrix.nupkg_rid }}-${{ steps.osu.outputs.tag }}
+
+      # Velopack installers need a real desktop install. GitHub-hosted runners
+      # don't provide that, so unpack the platform nupkg instead.
+      - name: Extract osu!lazer
+        run: ./.github/scripts/fetch-osu.ps1
+
+      - name: Build
+        run: dotnet build Maniac.sln -c Release "-p:LazerDir=$env:LAZER_DIR" "-p:ManiacBuildExpiry=$env:MANIAC_BUILD_EXPIRY" --nologo
+
+      - name: Test
+        run: dotnet test Maniac.sln -c Release "-p:LazerDir=$env:LAZER_DIR" --no-build --nologo
+
+      - name: Pack
+        id: pack
+        run: ./.github/scripts/pack.ps1 -Configuration Release -RuntimeIdentifier ${{ matrix.pack_rids }}
+
+      - name: Upload Windows
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maniac-win-x64
+          path: ${{ steps.pack.outputs.artifact }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload Linux
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maniac-linux-x64
+          path: ${{ steps.pack.outputs.artifact }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload macOS
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maniac-osx-arm64
+          path: ${{ steps.pack.outputs.artifact }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  build-stable:
+    runs-on: windows-latest
+    env:
+      MANIAC_BUILD_EXPIRY: ${{ github.event.inputs.build_expiry }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Publish
+        id: publish
+        shell: pwsh
+        run: ./.github/scripts/publish-stable.ps1 -Configuration Release
+
+      - name: Upload Windows
+        uses: actions/upload-artifact@v7
+        with:
+          name: maniac-stable-win-x86
+          path: ${{ steps.publish.outputs.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [test-core, build-lazer, build-stable]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: maniac-*
+          path: dist
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: ./.github/scripts/publish-release.ps1 -Dist dist
